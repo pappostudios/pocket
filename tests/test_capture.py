@@ -154,3 +154,26 @@ def test_recorder_reports_no_failures_on_a_clean_run(tmp_path):
     rec = Recorder([Finite(["X"], seed=1)], RecorderConfig(out_dir=tmp_path))
     assert asyncio.run(rec.run()) == {}
     assert rec.rows_written == 50
+
+
+# --- Missing data reads cleanly --------------------------------------------
+
+def test_load_ticks_on_an_empty_directory_returns_no_rows(tmp_path):
+    """DuckDB raises an IO error on a glob matching nothing; callers should see
+    an empty frame and report it, not a SQL parser traceback."""
+    df = load_ticks(tmp_path)
+    assert df.empty
+    assert list(df.columns) == ["symbol", "price", "ts_event", "ts_recv",
+                                "source", "bid", "ask"]
+
+
+def test_load_ticks_for_an_uncaptured_source_returns_no_rows(tmp_path):
+    with TickWriter(tmp_path, "present") as w:
+        for t in RandomWalkFeed(["X"], seed=1).generate(20):
+            w.append(t)
+    assert load_ticks(tmp_path, source="absent").empty
+    assert not load_ticks(tmp_path, source="present").empty
+
+
+def test_capture_summary_on_an_empty_directory_is_empty(tmp_path):
+    assert capture_summary(tmp_path).empty

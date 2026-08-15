@@ -46,6 +46,12 @@ class LabelSet:
         win: Boolean win flag. Refunded ties are False here but excluded from
             win-rate denominators by `win_rate()`, since a tie is neither a win
             nor a loss and counting it as a loss understates a real edge.
+        source_idx: Positions in the *input* arrays that survived labelling.
+            Rows are dropped when a contract cannot be settled honestly, so any
+            feature matrix built alongside the signals must be re-indexed by
+            this to stay aligned. Silent misalignment here would pair each row
+            of features with some other row's outcome — which destroys a study
+            without producing any visible error.
     """
 
     signal_ts: np.ndarray
@@ -56,6 +62,7 @@ class LabelSet:
     expiry_price: np.ndarray
     ret: np.ndarray
     win: np.ndarray
+    source_idx: np.ndarray
 
     def __len__(self) -> int:
         return len(self.signal_ts)
@@ -96,6 +103,7 @@ class LabelSet:
             expiry_price=self.expiry_price[idx],
             ret=self.ret[idx],
             win=self.win[idx],
+            source_idx=self.source_idx[idx],
         )
 
 
@@ -146,6 +154,7 @@ def label(
         & (expiry_ts <= last_ts)
     )
 
+    source_idx = np.flatnonzero(ok)
     signal_ts, entry_ts, expiry_ts = signal_ts[ok], entry_ts[ok], expiry_ts[ok]
     directions, raw_strike, expiry_price = directions[ok], raw_strike[ok], expiry_price[ok]
 
@@ -172,4 +181,5 @@ def label(
         expiry_price=expiry_price,
         ret=ret,
         win=win,
+        source_idx=source_idx,
     )

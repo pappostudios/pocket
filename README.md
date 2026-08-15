@@ -56,10 +56,21 @@ pytest -q
 ```
 
 `selftest` is the first thing to run and the first thing to re-run after any
-change. It backtests on a driftless random walk — where no edge can exist — and
-fails loudly if the pipeline reports one, because that means lookahead bias. It
-then confirms the pipeline *does* detect a deliberately planted edge in a
-mean-reverting series, since a test that can only say "no" is not a test.
+change. It exercises the whole pipeline on two known-answer processes: a
+driftless random walk, where no edge can exist, and a mean-reverting series with
+an edge deliberately planted. It fails loudly if a strategy looks profitable on
+the random walk (that means lookahead bias) *or* if the planted edge goes
+undetected — a pipeline that can only ever say "no" is not a test.
+
+Every analysis command also takes `--demo rw|ou`, so you can see the whole thing
+work before capturing anything:
+
+```bash
+pobot study --demo ou      # planted edge: PASS
+pobot study --demo rw      # pure noise:   FAIL
+pobot fingerprint --demo ou
+pobot lag --demo
+```
 
 ## Pipeline
 
@@ -68,8 +79,12 @@ feeds/       broker + independent reference prices, spec-driven, pure transport
 capture/     durable hour-partitioned Parquet, crash-safe via tmp→rename
 data/        read back ordered by arrival time, not by broker-claimed time
 backtest/    contract mechanics, honest labelling, lookahead-proof engine
+features/    causal features, proven causal by test rather than by convention
+model/       L2 logistic regression; train-fold-only standardisation
+analysis/    feed-lag estimation and random-walk fingerprinting
 validation/  purged walk-forward CV, then the statistical gate
 risk/        fractional Kelly and circuit breakers
+study.py     the orchestrator that actually answers the question
 ```
 
 ### Phase 1 — Capture
@@ -96,6 +111,25 @@ be run retroactively on broker-only data:
 Both feeds need a `ProtocolSpec` derived from live traffic — see
 [docs/PROTOCOL.md](docs/PROTOCOL.md). Unconfigured feeds raise rather than
 silently record nothing.
+
+Once you have dual-feed data, the two hypotheses become testable directly:
+
+```bash
+pobot lag --symbol EURUSD          # is the broker feed a delayed copy?
+pobot fingerprint --symbol EURUSD_otc   # is this series actually generated?
+```
+
+`lag` cross-correlates the two feeds across a range of offsets and reports the
+peak with a Šidák correction across every offset scanned — scanning enough
+offsets finds a peak in pure noise otherwise. A significant peak at a *positive*
+lag means the broker follows the reference. A peak at zero means they move
+together and there is nothing to exploit.
+
+`fingerprint` runs four independent tests against the random-walk null: a
+heteroskedasticity-robust Lo-MacKinlay variance ratio, Ljung-Box
+autocorrelation, price-grid quantisation, and a runs test on return signs. A hit
+means structure exists to model — not that it is tradeable. Structure still has
+to clear the payout, the spread, and entry latency.
 
 ### Phase 2 — Backtest
 
@@ -150,6 +184,33 @@ This leak is *the* reason retail bots backtest profitably and lose live.
 **Failing is the expected outcome.** The correct response to a fail is to discard
 the strategy, not to re-tune it on the same data until it passes — that is
 exactly the multiple-testing problem the correction exists to price in.
+
+### The study
+
+`pobot study` runs all of the above end to end and prints a verdict:
+
+```bash
+pobot study --symbol EURUSD --payout 0.92 --latency 250 --trials 12
+```
+
+Four properties make its answer trustworthy, each one a place the usual retail
+backtest goes wrong:
+
+1. **The model never sees its own test data.** Fitting *and* feature
+   standardisation happen inside each training fold. Standardising over the full
+   dataset first is the most common leak that survives cross-validation, because
+   it hides in preprocessing rather than in the labels.
+2. **The decision threshold is chosen on training data.** Picking the confidence
+   margin that maximises *test* profit is fitting the test set with extra steps.
+3. **Overlapping labels are purged**, as above.
+4. **It compares against the right baseline.** Beating 50% is not an edge — in a
+   drifting market "always call" beats 50%. The study reports the
+   majority-direction win rate alongside the model's, and a pass requires
+   beating *both* that and break-even.
+
+It also flags win-rate decay across folds, which distinguishes a regime that has
+ended from a stable edge. Pass `--trials` honestly: it is every outer
+configuration you tried, including the ones you threw away.
 
 ## Kill criteria
 

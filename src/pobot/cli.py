@@ -4,6 +4,14 @@
     pobot capture      record broker + reference feeds to Parquet
     pobot summary      coverage report on captured data
     pobot power        sample size needed to detect a given edge
+    pobot fingerprint  test a series against the random-walk null
+    pobot lag          estimate how far the broker feed trails a reference feed
+    pobot study        full out-of-sample study, gated
+
+The three analysis commands accept `--demo rw|ou` in place of captured data, so
+the pipeline can be exercised end to end before any capture exists. `rw` is a
+driftless random walk (no edge can exist); `ou` is mean-reverting (an edge is
+planted). Run both — a tool that only ever says "no" is not a test.
 """
 
 from __future__ import annotations
@@ -135,6 +143,35 @@ def cmd_selftest(args: argparse.Namespace) -> int:
 
     print()
     print("=" * 68)
+    print("SELFTEST 4: full study — the decisive end-to-end check")
+    print("=" * 68)
+    # Everything above tests a component. This runs the whole pipeline the way a
+    # real evaluation would: features, purged CV, in-fold threshold selection,
+    # then the gate. It must fail on the random walk and pass on the OU process.
+    from .study import run_study
+
+    rw_study = run_study(series, contract, n_splits=5, stride=5, min_gate_trades=200)
+    print(f"  random walk:    win rate {rw_study.win_rate:.2%} over "
+          f"{rw_study.trades} trades -> "
+          f"{'PASS' if rw_study.passed else 'FAIL'} (expected FAIL)")
+    if rw_study.passed:
+        print("\n!! The study reported a tradeable edge on a driftless random walk.")
+        print("!! No such edge exists. Every result this pipeline produces is")
+        print("!! unreliable until this is fixed.")
+        return 1
+
+    ou_study = run_study(series2, contract, n_splits=5, stride=5, min_gate_trades=200)
+    print(f"  mean reverting: win rate {ou_study.win_rate:.2%} over "
+          f"{ou_study.trades} trades -> "
+          f"{'PASS' if ou_study.passed else 'FAIL'} (expected PASS)")
+    if not ou_study.passed:
+        print("\n!! The study failed to find a deliberately planted edge. It will")
+        print("!! not find a real one either.")
+        return 1
+    print("\nOK: the study rejects noise and detects a real signal.")
+
+    print()
+    print("=" * 68)
     print("Sample sizes needed at a 92% payout (break-even 52.08%)")
     print("=" * 68)
     for wr in (0.53, 0.54, 0.55, 0.56):
@@ -180,6 +217,85 @@ def cmd_capture(args: argparse.Namespace) -> int:
     print(f"\nPartial capture: {rec.rows_written} rows from "
           f"{len(feeds) - len(failures)} of {len(feeds)} feeds.", file=sys.stderr)
     return 1
+
+
+def _demo_series(kind: str, n: int, seed: int = 7):
+    """Known-answer series for exercising a command without captured data."""
+    if kind == "rw":
+        feed = RandomWalkFeed(["DEMO"], interval_ms=1000, seed=seed)
+    elif kind == "ou":
+        feed = MeanRevertingFeed(["DEMO"], kappa=0.30, interval_ms=1000, seed=seed)
+    else:
+        raise ValueError(f"unknown demo series {kind!r} (expected 'rw' or 'ou')")
+    return ticks_to_series(feed.generate(n), "DEMO", feed.name)
+
+
+def _resolve_series(args: argparse.Namespace, *, source: str, n: int = 40_000):
+    """Load a captured series, or synthesise one in demo mode."""
+    if getattr(args, "demo", None):
+        print(f"[demo: {args.demo}] synthetic series, no captured data used\n")
+        return _demo_series(args.demo, n)
+
+    from .data.store import load_ticks, to_series
+
+    df = load_ticks(Path(args.dir), symbol=args.symbol, source=source)
+    if df.empty:
+        raise SystemExit(
+            f"no ticks for symbol={args.symbol} source={source} under {args.dir}. "
+            "Run `pobot summary` to see what was captured, or pass --demo rw|ou."
+        )
+    return to_series(df, args.symbol, source)
+
+
+def cmd_fingerprint(args: argparse.Namespace) -> int:
+    from .analysis.fingerprint import fingerprint
+
+    series = _resolve_series(args, source=args.source)
+    print(f"symbol={series.symbol} source={series.source}\n")
+    print(fingerprint(series, alpha=args.alpha).report())
+    return 0
+
+
+def cmd_lag(args: argparse.Namespace) -> int:
+    from .analysis.lag import estimate_lag
+
+    if args.demo:
+        # Broker feed is an exact 300ms-delayed copy — the detectable case.
+        from .feeds.synthetic import LaggedFeed
+
+        base = RandomWalkFeed(["DEMO"], interval_ms=100, seed=9)
+        reference = ticks_to_series(base.generate(8000), "DEMO", base.name)
+        lagged = LaggedFeed(RandomWalkFeed(["DEMO"], interval_ms=100, seed=9), 300)
+        broker = ticks_to_series(lagged.generate(8000), "DEMO", lagged.name)
+        print("[demo] broker feed is a 300ms-delayed copy of the reference\n")
+    else:
+        broker = _resolve_series(args, source=args.broker_source)
+        reference = _resolve_series(args, source=args.reference_source)
+
+    print(estimate_lag(broker, reference, grid_ms=args.grid_ms,
+                       max_lag_ms=args.max_lag_ms, alpha=args.alpha).report())
+    return 0
+
+
+def cmd_study(args: argparse.Namespace) -> int:
+    from .study import run_study
+
+    contract = BinaryContract(
+        payout=args.payout, duration_s=args.duration,
+        entry_latency_ms=args.latency, spread=args.spread,
+    )
+    series = _resolve_series(args, source=args.source)
+
+    print(f"contract: payout={contract.payout:.0%} duration={contract.duration_s}s "
+          f"latency={contract.entry_latency_ms}ms -> break-even "
+          f"{contract.break_even_rate:.2%}\n")
+
+    result = run_study(
+        series, contract, n_splits=args.splits, stride=args.stride,
+        n_trials=args.trials, alpha=args.alpha, min_gate_trades=args.min_trades,
+    )
+    print(result.report())
+    return 0 if result.passed else 1
 
 
 def cmd_summary(args: argparse.Namespace) -> int:
@@ -236,6 +352,44 @@ def main(argv: list[str] | None = None) -> int:
     pw.add_argument("--rates", type=float, nargs="+",
                     default=[0.53, 0.54, 0.55, 0.56, 0.58, 0.60])
     pw.set_defaults(func=cmd_power)
+
+    fp = sub.add_parser("fingerprint", help="test a series against the random-walk null")
+    fp.add_argument("--dir", default="data/ticks")
+    fp.add_argument("--symbol", default="EURUSD")
+    fp.add_argument("--source", default="pocketoption")
+    fp.add_argument("--alpha", type=float, default=0.05)
+    fp.add_argument("--demo", choices=["rw", "ou"], help="use a known-answer series")
+    fp.set_defaults(func=cmd_fingerprint)
+
+    lg = sub.add_parser("lag", help="estimate how far the broker feed trails a reference")
+    lg.add_argument("--dir", default="data/ticks")
+    lg.add_argument("--symbol", default="EURUSD")
+    lg.add_argument("--broker-source", default="pocketoption")
+    lg.add_argument("--reference-source", default="reference")
+    lg.add_argument("--grid-ms", type=int, default=100)
+    lg.add_argument("--max-lag-ms", type=int, default=3000)
+    lg.add_argument("--alpha", type=float, default=0.05)
+    lg.add_argument("--demo", action="store_const", const="rw",
+                    help="use a synthetic 300ms-delayed feed")
+    lg.set_defaults(func=cmd_lag)
+
+    sd = sub.add_parser("study", help="full out-of-sample study, gated")
+    sd.add_argument("--dir", default="data/ticks")
+    sd.add_argument("--symbol", default="EURUSD")
+    sd.add_argument("--source", default="pocketoption")
+    sd.add_argument("--payout", type=float, default=0.92)
+    sd.add_argument("--duration", type=int, default=60)
+    sd.add_argument("--latency", type=int, default=250,
+                    help="measured signal-to-fill latency in ms; guessing low invents an edge")
+    sd.add_argument("--spread", type=float, default=0.0)
+    sd.add_argument("--splits", type=int, default=5)
+    sd.add_argument("--stride", type=int, default=5)
+    sd.add_argument("--alpha", type=float, default=0.05)
+    sd.add_argument("--min-trades", type=int, default=1000)
+    sd.add_argument("--trials", type=int, default=1,
+                    help="outer configurations tried, INCLUDING the ones you discarded")
+    sd.add_argument("--demo", choices=["rw", "ou"], help="use a known-answer series")
+    sd.set_defaults(func=cmd_study)
 
     args = p.parse_args(argv)
     logging.basicConfig(
